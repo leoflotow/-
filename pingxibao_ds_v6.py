@@ -1,10 +1,11 @@
 import os
-import sys
+import sys  # 导入sys库，用于定位打包后的资源路径
 import time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
+import configparser
 import docx
-import fitz
+import fitz  # PyMuPDF
 from openai import OpenAI
 import threading
 import queue
@@ -12,15 +13,13 @@ import queue
 # ==============================================================================
 # --- 配置区 ---
 # ==============================================================================
-
-DEEPSEEK_API_KEY = "DeepSeek api key"
-
-EXAMPLE_RUBRIC_FILE = 'example_rubric.txt'
+CONFIG_FILE = 'config.ini'
+EXAMPLE_RUBRIC_FILE = 'example_rubric.txt'  # 定义示例文件名
 OUTPUT_FOLDER_NAME = "graded_feedback"
 MODEL_NAME = "deepseek-chat"
 
 # ==============================================================================
-# --- Prompt框架---
+# --- Prompt框架 (已包含防截断指令) ---
 # ==============================================================================
 PROMPT_FRAME = """
 # 角色
@@ -70,7 +69,33 @@ PROMPT_FRAME = """
 # --- 核心功能函数 ---
 # ==============================================================================
 
+def load_api_key():
+    """从config.ini文件中加载API Key。如果文件或Key不存在，则创建模板并提示用户。"""
+    config = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_FILE):
+        config['API'] = {'DEEPSEEK_API_KEY': 'YOUR_KEY_GOES_HERE'}
+        try:
+            with open(CONFIG_FILE, 'w') as configfile:
+                config.write(configfile)
+            messagebox.showinfo("首次运行提示",
+                                f"已为您创建配置文件 '{CONFIG_FILE}'。\n\n请打开该文件，填入您的DeepSeek API Key后，重新运行程序。")
+        except Exception as e:
+            messagebox.showerror("错误", f"创建配置文件失败: {e}")
+        return None
+    try:
+        config.read(CONFIG_FILE)
+        api_key = config.get('API', 'DEEPSEEK_API_KEY', fallback=None)
+    except configparser.Error as e:
+        messagebox.showerror("配置错误", f"读取 '{CONFIG_FILE}' 文件时出错: {e}\n\n请检查文件格式是否正确。")
+        return None
+    if not api_key or api_key == 'YOUR_KEY_GOES_HERE':
+        messagebox.showwarning("API Key未设置", f"请在 '{CONFIG_FILE}' 文件中设置您的API Key。")
+        return None
+    return api_key
+
+
 def get_user_input_with_gui(parent):
+    """在一个Toplevel窗口中让用户输入评分标准。"""
     rubric_text = ""
     dialog = tk.Toplevel(parent)
     dialog.title("步骤1: 输入本次实验的评分标准")
@@ -109,17 +134,20 @@ def get_user_input_with_gui(parent):
 
 
 def select_input_folder():
+    """弹出文件对话框让用户选择文件夹。"""
     folder_path = filedialog.askdirectory(title="步骤2: 请选择包含实验报告的文件夹")
     return folder_path
 
 
 def clean_ai_response(text):
+    """一个备用的清理函数，以防AI偶尔不完全遵守格式。"""
     if not isinstance(text, str): return ""
     text = text.replace('### ', '').replace('**', '').replace('* ', '  - ')
     return text.strip()
 
 
 def extract_text_from_file(file_path):
+    """根据文件扩展名，从.docx或.pdf文件中提取纯文本。"""
     if file_path.lower().endswith(".docx"):
         try:
             doc = docx.Document(file_path)
@@ -137,88 +165,83 @@ def extract_text_from_file(file_path):
 
 
 def grade_lab_report(report_text, client, model_name, user_rubric):
+    """调用DeepSeek API来批改实验报告，并增加超时设置。"""
     full_prompt = PROMPT_FRAME.format(user_rubric=user_rubric) + "\n\n" + report_text
     try:
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": full_prompt}],
-            temperature=0.2, max_tokens=2000, stream=False, timeout=60.0
+            temperature=0.2,
+            max_tokens=2000,
+            stream=False,
+            # === 关键修改：增加超时参数 ===
+            # 设置一个较长的超时时间，例如60秒。默认值通常较短。
+            timeout=60.0
         )
         return response.choices[0].message.content
     except Exception as e:
+        # 捕获并返回更详细的错误信息，便于调试
         return f"Error: 调用API时发生错误: {str(e)}"
 
-# ==============================================================================
-# --- (修改后) 工作线程函数 ---
-# ==============================================================================
 
 def batch_grading_worker(input_folder, user_rubric, client, progress_queue):
-    """这个函数在后台线程中运行，负责所有耗时操作"""
+    """这是在后台线程中运行的实际批阅工作函数。"""
     try:
         files_to_grade = [f for f in os.listdir(input_folder) if f.lower().endswith(('.docx', '.pdf'))]
         if not files_to_grade:
-            # 使用约定的 "FINISH:" 前缀来表示任务结束
             progress_queue.put("FINISH:在指定文件夹中没有找到任何.docx或.pdf文件。")
             return
 
         total_files = len(files_to_grade)
         success_count, error_count = 0, 0
-
-        # 创建输出文件夹
-        # os.path.dirname(input_folder) or '.' 确保即使选择根目录也能正常工作
-        output_folder_parent = os.path.dirname(input_folder) or '.'
-        output_folder = os.path.join(output_folder_parent, OUTPUT_FOLDER_NAME)
+        output_folder = os.path.join(os.path.dirname(input_folder) or '.', OUTPUT_FOLDER_NAME)
         os.makedirs(output_folder, exist_ok=True)
 
         for i, filename in enumerate(files_to_grade):
-            # 将当前进度放入队列
             progress_queue.put(f"正在处理: {i + 1}/{total_files} - {filename}")
-            
             file_path = os.path.join(input_folder, filename)
             report_content = extract_text_from_file(file_path)
-
             if report_content.startswith("Error:") or not report_content.strip():
-                progress_queue.put(f"跳过: {filename} (文件读取失败或内容为空)")
+                print(f"跳过文件 {filename}: {report_content}")
                 error_count += 1
                 continue
-            
-            ai_raw_feedback = grade_lab_report(report_content, client, MODEL_NAME, user_rubric)
 
+            ai_raw_feedback = grade_lab_report(report_content, client, MODEL_NAME, user_rubric)
             if ai_raw_feedback.startswith("Error:"):
-                progress_queue.put(f"失败: {filename} ({ai_raw_feedback})")
+                print(f"文件 {filename} 的AI处理失败: {ai_raw_feedback}")
                 error_count += 1
                 continue
 
             cleaned_feedback = clean_ai_response(ai_raw_feedback)
             base_name = os.path.splitext(filename)[0]
             output_filename = os.path.join(output_folder, f"评语_{base_name}.txt")
-
             try:
                 with open(output_filename, 'w', encoding='utf-8') as f:
                     f.write(cleaned_feedback)
                 success_count += 1
             except Exception as e:
-                progress_queue.put(f"保存失败: {filename} ({e})")
+                print(f"保存文件 {output_filename} 失败: {e}")
                 error_count += 1
-            
-            # 可以在这里稍微暂停，避免API调用过于频繁（如果需要）
-            # time.sleep(1) 
 
-        final_message = f"所有报告批阅完成！\n\n输出文件夹: {output_folder}\n成功: {success_count} 份\n失败: {error_count} 份"
+            time.sleep(1)
+
+        final_message = f"所有报告批阅完成！\n\n成功: {success_count} 份\n失败: {error_count} 份"
         progress_queue.put(f"FINISH:{final_message}")
-
     except Exception as e:
         progress_queue.put(f"FINISH:处理过程中发生意外错误: {e}")
 
-# ==============================================================================
-# --- (修改后) 主函数 ---
-# ==============================================================================
 
 def main():
     """主函数，负责GUI和启动工作线程。"""
     root = tk.Tk()
     root.withdraw()
     print("--- 实验报告评析宝 启动 ---")
+
+    api_key = load_api_key()
+    if not api_key:
+        print("API Key未配置，程序退出。")
+        return
+    print("API Key加载成功。")
 
     user_rubric = get_user_input_with_gui(root)
     if not user_rubric:
@@ -233,61 +256,44 @@ def main():
     print(f"已选择报告文件夹: {input_folder}")
 
     try:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-        print("API客户端初始化成功。")
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     except Exception as e:
-        messagebox.showerror("API客户端错误", f"初始化API客户端失败: {e}", parent=root)
+        messagebox.showerror("API客户端错误", f"初始化API客户端失败: {e}")
         return
 
-    # === 创建进度窗口和通信队列 ===
     loading_window = tk.Toplevel(root)
     loading_window.title("正在处理中...")
-    loading_window.geometry("450x200")
+    loading_window.geometry("400x150")
     loading_window.resizable(False, False)
     loading_window.attributes('-topmost', True)
-    loading_window.protocol("WM_DELETE_WINDOW", lambda: None) # 禁用关闭按钮
 
-    tk.Label(loading_window, text="AI正在全力工作中，请稍候...", font=("Arial", 16, "bold")).pack(pady=(20, 10))
-    tk.Label(loading_window, text="我正在快马加鞭地为您评阅报告，马上就好！", font=("Arial", 11), fg="gray").pack(pady=5)
-    
     progress_text = tk.StringVar(value="准备开始处理...")
-    tk.Label(loading_window, textvariable=progress_text, font=("Arial", 10), wraplength=420).pack(pady=10)
+    tk.Label(loading_window, text="请稍候，AI正在努力工作中...", font=("Arial", 14)).pack(pady=20)
+    tk.Label(loading_window, textvariable=progress_text, font=("Arial", 10), wraplength=380).pack(pady=10)
 
     progress_queue = queue.Queue()
-
-    # === 启动后台工作线程 ===
-    # 将需要传递给工作函数的参数打包成元组
-    worker_args = (input_folder, user_rubric, client, progress_queue)
-    worker_thread = threading.Thread(target=batch_grading_worker, args=worker_args, daemon=True)
+    worker_thread = threading.Thread(target=batch_grading_worker,
+                                     args=(input_folder, user_rubric, client, progress_queue))
     worker_thread.start()
 
-    # === 新增：定义一个函数来检查队列并更新GUI ===
-    def check_progress_queue():
+    def update_progress():
         try:
-            # get_nowait() 不会阻塞，如果队列为空会抛出异常
             message = progress_queue.get_nowait()
-            
             if message.startswith("FINISH:"):
-                # 任务完成
-                final_message = message.split(":", 1)[1]
                 loading_window.destroy()
-                messagebox.showinfo("任务完成", final_message, parent=root)
-                # 任务完成后可以关闭主程序
-                root.destroy()
+                final_summary = message.split(":", 1)[1]
+                messagebox.showinfo("任务完成", final_summary)
+                root.quit()
             else:
-                # 更新进度文本
                 progress_text.set(message)
-                # 100毫秒后再次检查队列
-                root.after(100, check_progress_queue)
+                root.after(100, update_progress)
         except queue.Empty:
-            # 队列为空，继续等待
-            root.after(100, check_progress_queue)
+            root.after(100, update_progress)
 
-    # === 开始轮询队列 ===
-    root.after(100, check_progress_queue)
-
-    # 启动tkinter的主事件循环（对于没有主窗口的程序，这种模式下需要它）
+    root.after(100, update_progress)
     root.mainloop()
+
+    print("--- 评析宝运行结束 ---")
 
 
 if __name__ == "__main__":

@@ -3,18 +3,17 @@ import sys
 import time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
-# configparser 库已不再需要
 import docx
 import fitz
 from openai import OpenAI
 import threading
-import queue  # <-- 新增导入
+import queue
 
 # ==============================================================================
 # --- 配置区 ---
 # ==============================================================================
 
-DEEPSEEK_API_KEY = "sk-d76e22b5011342c4a99be7a5e88dc3be"
+DEEPSEEK_API_KEY = "DeepSeek api key"
 
 EXAMPLE_RUBRIC_FILE = 'example_rubric.txt'
 OUTPUT_FOLDER_NAME = "graded_feedback"
